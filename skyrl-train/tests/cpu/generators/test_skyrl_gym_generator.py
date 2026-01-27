@@ -1754,6 +1754,11 @@ async def test_step_wise_reset_vs_no_reset_records_exact_prompts(mock_make, mock
             return self.encode(joined, add_special_tokens=False)
 
     tokenizer = TraceTokenizer()
+    import os
+
+    def _decode_token_ids(token_ids: List[int]) -> str:
+        # TraceTokenizer uses ord(c) per character, so decoding is just chr().
+        return "".join(chr(i) for i in token_ids)
 
     async def run_and_capture_prompts(*, cfg_overrides, env_factory):
         captured: List[List[int]] = []
@@ -1827,6 +1832,9 @@ async def test_step_wise_reset_vs_no_reset_records_exact_prompts(mock_make, mock
         cfg_overrides={"use_conversation_multi_turn": True, "step_wise_trajectories": True},
         env_factory=EnvNoReset,
     )
+    if os.getenv("SKYRL_PRINT_PROMPTS") == "1":
+        print("no_reset_prompts (token_ids):", no_reset_prompts)
+        print("no_reset_prompts (decoded):", [_decode_token_ids(x) for x in no_reset_prompts])
 
     expected_no_reset = [
         tokenizer.encode("Q<G>"),
@@ -1865,6 +1873,9 @@ async def test_step_wise_reset_vs_no_reset_records_exact_prompts(mock_make, mock
         },
         env_factory=EnvReset,
     )
+    if os.getenv("SKYRL_PRINT_PROMPTS") == "1":
+        print("reset_prompts (token_ids):", reset_prompts)
+        print("reset_prompts (decoded):", [_decode_token_ids(x) for x in reset_prompts])
 
     expected_reset = [
         tokenizer.encode("Q"),

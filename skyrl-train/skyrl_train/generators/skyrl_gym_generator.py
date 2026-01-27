@@ -478,7 +478,10 @@ class SkyRLGymGenerator(GeneratorInterface):
             ), f"loss_mask and response_ids should have the same length, got {len(loss_mask)} and {len(response_ids)}"
 
         appended_eos_token = False
-        if not self.use_conversation_multi_turn:
+        # For step-wise trajectories we return per-step outputs (each step already carries its own
+        # response_ids/loss_mask). The single-trajectory `response_ids` / `loss_mask` finalization
+        # only applies to non-step-wise mode.
+        if not self.use_conversation_multi_turn and not self.generator_cfg.step_wise_trajectories:
             assert response_ids is not None and loss_mask is not None
             if stop_reason != "length" and response_ids and response_ids[-1] != self.tokenizer.eos_token_id:
                 response_ids.append(self.tokenizer.eos_token_id)

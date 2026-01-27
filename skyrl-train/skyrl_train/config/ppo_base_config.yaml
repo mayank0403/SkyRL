@@ -299,6 +299,12 @@ generator:
   # number of samples per prompt for evaluation
   eval_n_samples_per_prompt: 1
 
+  # Step-wise rollout support without chat templates.
+  # When enabled, each env step's prompt is rebuilt from a fixed prefix (optionally including
+  # the initial prompt) plus the latest observation snapshot, instead of growing chat history.
+  reset_prompt_each_step: false
+  reset_prompt_include_initial_prompt: true
+
   # NOTE (sumanthrh): This flag sets the reward to 0 if the `stop_reason` is not `stop`.
   # This is useful in cases where the LLM generation was truncated or aborted.
   # Cases where this is useful: Often, we have format rewards for the LLM to follow,
