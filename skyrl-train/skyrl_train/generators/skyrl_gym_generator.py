@@ -56,6 +56,7 @@ class AgentLoopState:
     rollout_logprobs: Optional[List[float]]
     response_end_idx: Optional[int]
     done: bool
+    reset_prefix_ids: Optional[List[int]] = None
 
 
 @dataclass
@@ -132,28 +133,31 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         self._validate_cfg(generator_cfg)
 
-        # base_conversation is used when `use_conversation_multi_turn==True and custom_chat_template==None` to
-        # correctly format and tokenize observations into `observation_ids`.
+        # base_conversation is used only when `use_conversation_multi_turn==True` to correctly format and tokenize
+        # observations into `observation_ids` without retokenizing the full chat history every turn.
         # Follows https://jybsuper.github.io/posts/multiturn_tokenization/#the-breakthrough-fixed-base-approach
-        self.base_conversation = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": "I am a user."},
-        ]
-        self.base_conversation_token_ids = tokenizer.apply_chat_template(
-            self.base_conversation,
-            add_generation_prompt=False,
-            tokenize=True,
-            **self.generator_cfg.chat_template_kwargs,
-        )
-        # We remove tokens after the last EOS token so that it can be captured in `observation_ids`.
-        # For details, see https://docs.skyrl.ai/docs/tutorials/skyrl_gym_generator#multi-turn-tokenization-and-ti-to
-        if self.tokenizer.eos_token_id in self.base_conversation_token_ids:
-            last_eos_token_index = (
-                len(self.base_conversation_token_ids)
-                - 1
-                - self.base_conversation_token_ids[::-1].index(self.tokenizer.eos_token_id)
+        self.base_conversation = []
+        self.base_conversation_token_ids = []
+        if self.use_conversation_multi_turn:
+            self.base_conversation = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "I am a user."},
+            ]
+            self.base_conversation_token_ids = tokenizer.apply_chat_template(
+                self.base_conversation,
+                add_generation_prompt=False,
+                tokenize=True,
+                **self.generator_cfg.chat_template_kwargs,
             )
-            self.base_conversation_token_ids = self.base_conversation_token_ids[: last_eos_token_index + 1]
+            # We remove tokens after the last EOS token so that it can be captured in `observation_ids`.
+            # For details, see https://docs.skyrl.ai/docs/tutorials/skyrl_gym_generator#multi-turn-tokenization-and-ti-to
+            if self.tokenizer.eos_token_id in self.base_conversation_token_ids:
+                last_eos_token_index = (
+                    len(self.base_conversation_token_ids)
+                    - 1
+                    - self.base_conversation_token_ids[::-1].index(self.tokenizer.eos_token_id)
+                )
+                self.base_conversation_token_ids = self.base_conversation_token_ids[: last_eos_token_index + 1]
 
     def _validate_cfg(self, generator_cfg: DictConfig):
         if len(generator_cfg.chat_template_kwargs) and generator_cfg.batched:
@@ -169,9 +173,40 @@ class SkyRLGymGenerator(GeneratorInterface):
                 raise ValueError(
                     f"`step_wise_trajectories` doesn't support custom chat template, got {generator_cfg.chat_template}"
                 )
+            # Default behavior: step-wise uses multi-turn chat templating.
+            # Exception: `reset_prompt_each_step` allows running without chat templates.
+            if not self.use_conversation_multi_turn and not getattr(self.generator_cfg, "reset_prompt_each_step", False):
+                raise ValueError("`step_wise_trajectories` requires `use_conversation_multi_turn=True` unless `reset_prompt_each_step=True`")
 
-            if not self.use_conversation_multi_turn:
-                raise ValueError("`step_wise_trajectories` doesn't support `use_conversation_multi_turn=False`")
+        if getattr(self.generator_cfg, "reset_prompt_each_step", False):
+            if self.use_conversation_multi_turn:
+                raise ValueError("`reset_prompt_each_step` requires `use_conversation_multi_turn=False`")
+            if not self.generator_cfg.step_wise_trajectories:
+                raise ValueError("`reset_prompt_each_step` currently requires `step_wise_trajectories=True`")
+
+    def _flatten_conversation_to_text(self, messages: ConversationType) -> str:
+        """
+        Flatten a conversation (list of role/content dicts) into a raw text prompt.
+
+        This is used when `use_conversation_multi_turn=False` so we avoid any chat templating.
+        """
+        joiner = getattr(self.generator_cfg, "plaintext_conversation_joiner", "\n")
+        return joiner.join(str(m.get("content", "")) for m in messages)
+
+    def _build_reset_prefix_ids(self, initial_chat_history: ConversationType) -> List[int]:
+        """
+        Build a fixed prefix for `reset_prompt_each_step` mode.
+
+        By default we include the initial prompt (after `env.init`) as the fixed prefix so the task
+        instruction is preserved across steps.
+        """
+        include_initial = getattr(self.generator_cfg, "reset_prompt_include_initial_prompt", True)
+        if not include_initial:
+            return []
+        prefix_text = self._flatten_conversation_to_text(initial_chat_history)
+        if not prefix_text:
+            return []
+        return self.tokenizer.encode(prefix_text, add_special_tokens=False)
 
     async def _run_in_executor_if_available(self, func, *args, **kwargs):
         if (executor := self.env_executor) is not None:
@@ -236,15 +271,23 @@ class SkyRLGymGenerator(GeneratorInterface):
         # init() returns the first prompt to be given to the model, and optional metadata dict
         chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
         initial_chat_history_length = len(chat_history)
-        initial_input_ids = self.tokenizer.apply_chat_template(
-            chat_history,
-            # If retokenize_chat_history==True, avoid including the generation prompt in both the
-            # prompt_ids and response_ids due to how `response_encodings["input_ids"]` works.
-            add_generation_prompt=not retokenize_chat_history,
-            chat_template=self.custom_chat_template if retokenize_chat_history else None,
-            tokenize=True,
-            **self.generator_cfg.chat_template_kwargs,
-        )
+        reset_prefix_ids: Optional[List[int]] = None
+        if getattr(self.generator_cfg, "reset_prompt_each_step", False) and not self.use_conversation_multi_turn:
+            reset_prefix_ids = self._build_reset_prefix_ids(chat_history)
+        if self.use_conversation_multi_turn:
+            initial_input_ids = self.tokenizer.apply_chat_template(
+                chat_history,
+                # If retokenize_chat_history==True, avoid including the generation prompt in both the
+                # prompt_ids and response_ids due to how `response_encodings["input_ids"]` works.
+                add_generation_prompt=not retokenize_chat_history,
+                chat_template=self.custom_chat_template if retokenize_chat_history else None,
+                tokenize=True,
+                **self.generator_cfg.chat_template_kwargs,
+            )
+        else:
+            # No chat template: only used by `reset_prompt_each_step`.
+            prompt_text = self._flatten_conversation_to_text(chat_history)
+            initial_input_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
 
         initial_prompt_length = len(initial_input_ids)
         loss_mask = []  # this excludes the prompt
@@ -267,6 +310,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             rollout_logprobs=[] if get_logprobs else None,
             response_end_idx=None,
             done=False,
+            reset_prefix_ids=reset_prefix_ids,
         )
 
         while not agent_loop_state.done:
@@ -276,8 +320,9 @@ class SkyRLGymGenerator(GeneratorInterface):
                 break
 
             # 1. Generate output
-            if is_step_wise or retokenize_chat_history:
-                # re-apply whole chat template so length check is correct
+            if retokenize_chat_history or (is_step_wise and self.use_conversation_multi_turn):
+                # Re-apply whole chat template so length check is correct (chat-template path).
+                # If `use_conversation_multi_turn=False` (reset mode), we stay purely in token space.
                 agent_loop_state.input_ids = self.tokenizer.apply_chat_template(
                     chat_history,
                     chat_template=self.custom_chat_template if retokenize_chat_history else None,
@@ -382,7 +427,12 @@ class SkyRLGymGenerator(GeneratorInterface):
                     agent_loop_state, turn_output
                 )
 
-            per_step_rewards.append((step_reward, agent_loop_state.response_end_idx))
+            # For step-wise, rewards are assigned to the last token of the response for *this step*
+            # within `per_step_output.response_ids` (which is `output_ids + obs_ids`).
+            if is_step_wise:
+                per_step_rewards.append((step_reward, len(turn_output.output_ids) - 1))
+            else:
+                per_step_rewards.append((step_reward, agent_loop_state.response_end_idx))
 
         # Get environment-specific metrics after the episode is done
         env_metrics = env.get_metrics()
@@ -533,6 +583,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     obs_tokens = self.tokenizer.encode(obs["content"], add_special_tokens=False)
                     obs_ids_to_add.extend(obs_tokens)
         return obs_ids_to_add
+
 
     def _update_chat_history(
         self,
@@ -946,6 +997,18 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         obs_ids_to_add = turn_output.obs_ids
 
+        # Reset mode: next prompt is rebuilt from a fixed prefix + latest observation snapshot only.
+        # This is intended for env-managed context, where observations contain a compact full state.
+        if getattr(self.generator_cfg, "reset_prompt_each_step", False):
+            prefix = agent_loop_state.reset_prefix_ids or []
+            agent_loop_state.input_ids = [*prefix, *obs_ids_to_add]
+            agent_loop_state.response_end_idx = None
+            if self.generator_cfg.step_wise_trajectories:
+                # no running loss_mask/logprobs tracked for step-wise
+                agent_loop_state.loss_mask = None
+                agent_loop_state.rollout_logprobs = None
+            return agent_loop_state
+
         # Remove EOS token from response tokens since we are continuing the current assistant message
         new_resp_tokens = turn_output.output_ids.copy()
         if new_resp_tokens and new_resp_tokens[-1] == self.tokenizer.eos_token_id:
@@ -964,8 +1027,13 @@ class SkyRLGymGenerator(GeneratorInterface):
         # Directly append turn output
         agent_loop_state.response_end_idx = len(agent_loop_state.input_ids) + len(new_resp_tokens) - 1
         agent_loop_state.input_ids += turn_ids
-        agent_loop_state.loss_mask += loss_mask_for_turn
-        if agent_loop_state.rollout_logprobs is not None and rollout_logprobs_for_turn is not None:
-            agent_loop_state.rollout_logprobs += rollout_logprobs_for_turn
+        if self.generator_cfg.step_wise_trajectories:
+            agent_loop_state.loss_mask = None
+            agent_loop_state.rollout_logprobs = None
+        else:
+            assert agent_loop_state.loss_mask is not None
+            agent_loop_state.loss_mask += loss_mask_for_turn
+            if agent_loop_state.rollout_logprobs is not None and rollout_logprobs_for_turn is not None:
+                agent_loop_state.rollout_logprobs += rollout_logprobs_for_turn
 
         return agent_loop_state

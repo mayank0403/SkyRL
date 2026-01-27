@@ -1627,3 +1627,248 @@ async def test_step_wise_trajectories_basic_output_validation(mock_make, mock_to
     # Validate stop_reasons
     for i, stop_reason in enumerate(generator_output["stop_reasons"]):
         assert isinstance(stop_reason, str), f"stop_reasons[{i}] should be a string"
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
+async def test_step_wise_no_chat_template_reset_prompt_each_step(mock_make, mock_llm, mock_env_cfg):
+    """
+    Reset-prompt mode: after each env step, the next prompt should be rebuilt from a fixed prefix + latest obs only.
+    This should prevent prompt growth even if observations grow.
+    """
+    from skyrl_train.generators.base import TrajectoryID
+
+    class NoChatTemplateTokenizer:
+        eos_token_id = 4
+        eos_token = "<eos>"
+
+        def apply_chat_template(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("apply_chat_template should not be called when use_conversation_multi_turn=False")
+
+        def encode(self, text, add_special_tokens=False):
+            # Encode length depends on text length.
+            n = max(1, len(str(text)))
+            return list(range(n))
+
+    tokenizer = NoChatTemplateTokenizer()
+
+    async def llm_generate_side_effect(input_batch):
+        num = len(input_batch["prompt_token_ids"])
+        return {
+            "responses": ["step"] * num,
+            "stop_reasons": ["stop"] * num,
+            "response_logprobs": None,
+            "response_ids": [[10, 11, tokenizer.eos_token_id] for _ in range(num)],
+        }
+
+    mock_llm.generate = AsyncMock(side_effect=llm_generate_side_effect)
+
+    class MultiStepEnv(BaseTextEnv):
+        def __init__(self):
+            super().__init__()
+            self.turns = 0
+
+        def init(self, prompt):
+            return prompt, {}
+
+        def step(self, action):
+            self.turns += 1
+            if self.turns < 4:
+                # Observation snapshot is bounded (env-managed context).
+                return BaseTextEnvStepOutput(
+                    observations=[{"role": "user", "content": "state:" + ("x" * 64)}],
+                    reward=0.0,
+                    done=False,
+                    metadata={},
+                )
+            return BaseTextEnvStepOutput(observations=[], reward=1.0, done=True, metadata={})
+
+    mock_make.return_value = MultiStepEnv()
+
+    cfg = get_default_config().generator
+    cfg.sampling_params.max_generate_length = 50
+    cfg.sampling_params.logprobs = None
+    cfg.apply_overlong_filtering = False
+    cfg.max_input_length = 10_000
+    cfg.batched = False
+    cfg.max_turns = 10
+    cfg.zero_reward_on_non_stop = False
+    cfg.use_conversation_multi_turn = False
+    cfg.step_wise_trajectories = True
+    cfg.chat_template = {"source": "name", "name_or_path": None}
+
+    cfg.reset_prompt_each_step = True
+    cfg.reset_prompt_include_initial_prompt = True
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=tokenizer,
+        model_name="test_model",
+    )
+
+    prompts = [[{"role": "user", "content": "TASK: do the thing"}]]
+    env_extras = [{"test": "value"}]
+    trajectory_ids = [TrajectoryID(instance_id="uid1", repetition_id=0)]
+    input_batch: GeneratorInput = {
+        "prompts": prompts,
+        "env_extras": env_extras,
+        "env_classes": [mock_env_cfg.env_class],
+        "trajectory_ids": trajectory_ids,
+    }
+
+    out: GeneratorOutput = await generator.generate(input_batch, disable_tqdm=True)
+    assert len(out["prompt_token_ids"]) == 4
+    lens = [len(p) for p in out["prompt_token_ids"]]
+
+    # Prompt may change between step 0 and 1 (switching to prefix+obs reset),
+    # but after that it should stay constant since obs snapshots are bounded.
+    assert lens[2] == lens[1] and lens[3] == lens[1]
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
+async def test_step_wise_reset_vs_no_reset_records_exact_prompts(mock_make, mock_env_cfg):
+    """
+    Record the *exact* prompt_token_ids sent to the inference engine across turns:
+    - step-wise without reset (chat-template multi-turn): prompts grow as chat_history grows
+    - step-wise with reset (no chat template): prompts reset to fixed prefix + latest observation snapshot
+    """
+    from skyrl_train.generators.base import TrajectoryID
+
+    class TraceTokenizer:
+        eos_token_id = 4
+        eos_token = "<eos>"
+
+        def encode(self, text, add_special_tokens=False):
+            # Deterministic "tokens" from characters for easy expected-values.
+            return [ord(c) for c in str(text)]
+
+        def apply_chat_template(self, messages, **kwargs):
+            joined = "||".join(str(m.get("content", "")) for m in messages)
+            if kwargs.get("add_generation_prompt", False):
+                joined += "<G>"
+            if not kwargs.get("tokenize", True):
+                return joined
+            return self.encode(joined, add_special_tokens=False)
+
+    tokenizer = TraceTokenizer()
+
+    async def run_and_capture_prompts(*, cfg_overrides, env_factory):
+        captured: List[List[int]] = []
+
+        async def llm_generate_side_effect(input_batch):
+            # capture the single prompt for this step
+            captured.append(input_batch["prompt_token_ids"][0])
+            step_idx = len(captured)
+            return {
+                "responses": [f"A{step_idx}"],
+                "stop_reasons": ["stop"],
+                "response_logprobs": None,
+                "response_ids": [[10, tokenizer.eos_token_id]],
+            }
+
+        mock_llm = MagicMock()
+        mock_llm.generate = AsyncMock(side_effect=llm_generate_side_effect)
+
+        mock_make.return_value = env_factory()
+
+        cfg = get_default_config().generator
+        cfg.sampling_params.max_generate_length = 50
+        cfg.sampling_params.logprobs = None
+        cfg.apply_overlong_filtering = False
+        cfg.max_input_length = 10_000
+        cfg.batched = False
+        cfg.max_turns = 10
+        cfg.zero_reward_on_non_stop = False
+        cfg.chat_template = {"source": "name", "name_or_path": None}
+
+        for k, v in cfg_overrides.items():
+            setattr(cfg, k, v)
+
+        generator = SkyRLGymGenerator(
+            generator_cfg=cfg,
+            skyrl_gym_cfg=mock_env_cfg,
+            inference_engine_client=mock_llm,
+            tokenizer=tokenizer,
+            model_name="test_model",
+        )
+
+        prompts = [[{"role": "user", "content": "Q"}]]
+        env_extras = [{"test": "value"}]
+        trajectory_ids = [TrajectoryID(instance_id="uid1", repetition_id=0)]
+        input_batch: GeneratorInput = {
+            "prompts": prompts,
+            "env_extras": env_extras,
+            "env_classes": [mock_env_cfg.env_class],
+            "trajectory_ids": trajectory_ids,
+        }
+
+        await generator.generate(input_batch, disable_tqdm=True)
+        return captured
+
+    # Case 1: step-wise without reset (chat template multi-turn): prompts grow with assistant outputs.
+    class EnvNoReset(BaseTextEnv):
+        def __init__(self):
+            super().__init__()
+            self.turns = 0
+
+        def init(self, prompt):
+            return prompt, {}
+
+        def step(self, action):
+            self.turns += 1
+            # no observations needed; chat_history still grows from assistant messages
+            done = self.turns >= 3
+            return BaseTextEnvStepOutput(observations=[], reward=0.0, done=done, metadata={})
+
+    no_reset_prompts = await run_and_capture_prompts(
+        cfg_overrides={"use_conversation_multi_turn": True, "step_wise_trajectories": True},
+        env_factory=EnvNoReset,
+    )
+
+    expected_no_reset = [
+        tokenizer.encode("Q<G>"),
+        tokenizer.encode("Q||A1<G>"),
+        tokenizer.encode("Q||A1||A2<G>"),
+    ]
+    assert no_reset_prompts == expected_no_reset
+
+    # Case 2: step-wise with reset (no chat template): prompt = prefix("Q") + latest obs snapshot.
+    class EnvReset(BaseTextEnv):
+        def __init__(self):
+            super().__init__()
+            self.turns = 0
+
+        def init(self, prompt):
+            return prompt, {}
+
+        def step(self, action):
+            self.turns += 1
+            if self.turns == 1:
+                return BaseTextEnvStepOutput(
+                    observations=[{"role": "user", "content": "S1"}], reward=0.0, done=False, metadata={}
+                )
+            if self.turns == 2:
+                return BaseTextEnvStepOutput(
+                    observations=[{"role": "user", "content": "S2"}], reward=0.0, done=False, metadata={}
+                )
+            return BaseTextEnvStepOutput(observations=[], reward=0.0, done=True, metadata={})
+
+    reset_prompts = await run_and_capture_prompts(
+        cfg_overrides={
+            "use_conversation_multi_turn": False,
+            "step_wise_trajectories": True,
+            "reset_prompt_each_step": True,
+            "reset_prompt_include_initial_prompt": True,
+        },
+        env_factory=EnvReset,
+    )
+
+    expected_reset = [
+        tokenizer.encode("Q"),
+        tokenizer.encode("Q") + tokenizer.encode("S1"),
+        tokenizer.encode("Q") + tokenizer.encode("S2"),
+    ]
+    assert reset_prompts == expected_reset
