@@ -7,6 +7,9 @@ For details, see https://docs.skyrl.ai/docs/tutorials/skyrl_gym_generator
 
 import asyncio
 import copy
+import json
+import time
+from pathlib import Path
 from uuid import uuid4
 import skyrl_gym
 from typing import List, Dict, Any, Optional, Union, Tuple
@@ -26,6 +29,9 @@ from skyrl_train.generators.utils import (
     apply_overlong_filtering,
     get_rollout_metrics,
 )
+
+def _safe_filename(text: str) -> str:
+    return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in (text or ""))[:255]
 
 
 @dataclass
@@ -215,6 +221,117 @@ class SkyRLGymGenerator(GeneratorInterface):
         else:
             return func(*args, **kwargs)
 
+    def _maybe_log_exact_model_prompt(
+        self,
+        *,
+        prompt_token_ids: List[int],
+        session_id: str,
+        env_step_metadata: Optional[Dict[str, Any]],
+        env_extras: Optional[Dict[str, Any]] = None,
+        env_class: Optional[str] = None,
+    ) -> None:
+        """
+        Optionally log the exact prompt the model saw (token IDs and decoded text).
+
+        This is implemented in the generator (not the env) so it captures the *actual*
+        prompt passed to the inference engine, including reset-prompt modes and any
+        chat templating behavior.
+        """
+        log_dir = getattr(self.generator_cfg, "exact_prompt_log_dir", None)
+        if not log_dir:
+            return
+
+        # Best-effort only: never crash training on logging failures.
+        try:
+            root_dir = Path(str(log_dir)).expanduser().resolve()
+            with_ids_dir = root_dir / "with_token_ids"
+            without_ids_dir = root_dir / "without_token_ids"
+            with_ids_dir.mkdir(parents=True, exist_ok=True)
+            without_ids_dir.mkdir(parents=True, exist_ok=True)
+
+            md = env_step_metadata or {}
+            # Prefer canonical identifiers returned by the environment.
+            example_id = str(md.get("example_id") or "unknown_example")
+            trajectory_id = str(md.get("trajectory_id") or "unknown_trajectory")
+            turn = md.get("turn", None)
+
+            # Fallback: infer example_id from per-sample payload if env didn't provide it.
+            if example_id == "unknown_example":
+                extras = env_extras or {}
+                payload = extras.get("data") if isinstance(extras, dict) else None
+                if not isinstance(payload, dict):
+                    payload = {}
+                example_id = str(payload.get("example_id") or payload.get("repo") or "unknown_example")
+
+            # Group by example_id so it's easy to diff against EasyCryptEnv's per-example JSON logs.
+            with_ids_path = with_ids_dir / f"{_safe_filename(example_id)}.jsonl"
+            without_ids_path = without_ids_dir / f"{_safe_filename(example_id)}.jsonl"
+
+            decode_text = getattr(self.generator_cfg, "exact_prompt_log_decode", True)
+            max_chars = getattr(self.generator_cfg, "exact_prompt_log_max_chars", None)
+
+            prompt_text_raw = None
+            prompt_text_clean = None
+            if decode_text:
+                try:
+                    prompt_text_raw = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
+                except Exception:
+                    prompt_text_raw = None
+                try:
+                    prompt_text_clean = self.tokenizer.decode(prompt_token_ids, skip_special_tokens=True)
+                except Exception:
+                    prompt_text_clean = None
+
+            if (
+                isinstance(max_chars, int)
+                and max_chars > 0
+                and isinstance(prompt_text_raw, str)
+                and len(prompt_text_raw) > max_chars
+            ):
+                prompt_text_raw = prompt_text_raw[:max_chars]
+            if (
+                isinstance(max_chars, int)
+                and max_chars > 0
+                and isinstance(prompt_text_clean, str)
+                and len(prompt_text_clean) > max_chars
+            ):
+                prompt_text_clean = prompt_text_clean[:max_chars]
+
+            base_record = {
+                "ts_unix": time.time(),
+                "session_id": session_id,
+                "example_id": example_id,
+                "trajectory_id": trajectory_id,
+                "prompt_token_count": int(len(prompt_token_ids)),
+                "turn": int(turn) if isinstance(turn, int) else turn,
+                "env_class": env_class,
+                "prompt_text_clean": prompt_text_clean,
+            }
+            with_ids_record = dict(base_record)
+            with_ids_record["prompt_token_ids"] = prompt_token_ids
+            with_ids_record["prompt_text_raw"] = prompt_text_raw
+
+            # Append with a file lock for multi-worker safety.
+            import fcntl
+
+            with open(with_ids_path, "a", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(json.dumps(with_ids_record, ensure_ascii=False) + "\n")
+                    f.flush()
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+            with open(without_ids_path, "a", encoding="utf-8") as f:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                try:
+                    f.write(json.dumps(base_record, ensure_ascii=False) + "\n")
+                    f.flush()
+                finally:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception as exc:
+            logger.warning(f"exact_prompt_log: failed to write prompt log: {exc}")
+
     async def agent_loop(
         self,
         prompt: ConversationType,
@@ -333,6 +450,11 @@ class SkyRLGymGenerator(GeneratorInterface):
                 agent_loop_state.loss_mask = []
                 agent_loop_state.rollout_logprobs = None
 
+            # Snapshot the *exact* prompt token IDs we are about to send to the model.
+            # We log it only after env.step() returns metadata, but this snapshot ensures
+            # we capture the prompt for the current step (not the next-step prompt).
+            prompt_token_ids_for_turn = list(agent_loop_state.input_ids)
+
             engine_input = InferenceEngineInput(
                 prompt_token_ids=[agent_loop_state.input_ids], session_ids=[session_id], sampling_params=sampling_params
             )
@@ -368,6 +490,15 @@ class SkyRLGymGenerator(GeneratorInterface):
             step_reward: float = env_step_output["reward"]
             agent_loop_state.done = env_step_output["done"]
 
+            # Optional: log the exact prompt seen by the model for this step (post-env).
+            # We use env-provided metadata so example_id/trajectory_id are correct.
+            self._maybe_log_exact_model_prompt(
+                prompt_token_ids=prompt_token_ids_for_turn,
+                session_id=session_id,
+                env_step_metadata=env_step_output.get("metadata", None),
+                env_extras=env_extras,
+                env_class=env_class,
+            )
             if env_step_output.get("postprocessed_action", None) is not None:
                 # TODO(Charlie): come back to this, we should deprecate postprocessed action
                 logger.warning(
