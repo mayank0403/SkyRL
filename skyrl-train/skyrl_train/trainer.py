@@ -760,37 +760,180 @@ class RayPPOTrainer:
         token_level_rewards = data["rewards"]
 
         if self.cfg.generator.step_wise_trajectories:
-            is_last_step = data["is_last_step"].bool()
-            response_mask = data["response_mask"]
-            index = np.array(data.metadata["uids"])
-            adv_estimator = self.cfg.trainer.algorithm.advantage_estimator
-            config = self.cfg.trainer.algorithm
-            values = data["values"]
-            gamma = self.cfg.trainer.algorithm.gamma
-            lambd = self.cfg.trainer.algorithm.lambd
-            grpo_norm_by_std = self.cfg.trainer.algorithm.grpo_norm_by_std
-            last_step_rewards = token_level_rewards[is_last_step]
-            # compatible with any advantage estimator
-            last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
-                token_level_rewards=last_step_rewards,
-                response_mask=response_mask[is_last_step],
-                index=index[is_last_step.cpu().numpy()],
-                adv_estimator=adv_estimator,
-                values=values[is_last_step] if values is not None else None,
-                config=config,
-                gamma=gamma,
-                lambd=lambd,
-                grpo_norm_by_std=grpo_norm_by_std,
-            )
-            traj_ids = (
-                torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]]).int().cumsum(dim=0)
-            )
-            num_groups = traj_ids[-1].item() + 1
-            assert num_groups == len(
-                last_step_advantages
-            ), f"number of groups {num_groups} doesn't match the number of trajectories as given by `is_last_step` {len(last_step_advantages)}. The `is_last_step` tensor is likely malformed"
-            advantages = last_step_advantages[traj_ids]
-            returns = last_step_returns[traj_ids]
+            # Step-wise credit assignment behavior:
+            # - "broadcast_last_step" (default): compute advantages/returns only on last step of each trajectory,
+            #   then broadcast them to all steps (legacy SkyRL behavior).
+            # - "discounted_return_to_go": compute per-step discounted return-to-go within each trajectory so
+            #   intermediate shaping rewards contribute to the learning signal.
+            if not hasattr(self.cfg.trainer.algorithm, "stepwise_credit_assignment"):
+                raise ValueError(
+                    "Missing required config: trainer.algorithm.stepwise_credit_assignment. "
+                    "This must be explicitly set when generator.step_wise_trajectories=true "
+                    "(e.g. +trainer.algorithm.stepwise_credit_assignment=broadcast_last_step)."
+                )
+            stepwise_mode = self.cfg.trainer.algorithm.stepwise_credit_assignment
+            if stepwise_mode is None:
+                raise ValueError(
+                    "trainer.algorithm.stepwise_credit_assignment is None. "
+                    "This must be explicitly set when generator.step_wise_trajectories=true."
+                )
+            stepwise_mode = str(stepwise_mode)
+            if stepwise_mode == "discounted_return_to_go":
+                # This mode is intended to be used with GRPO (no critic). We compute discounted return-to-go
+                # per env step within each trajectory, then apply GRPO-style group normalization across
+                # rollouts for the same prompt (uid) at the same step index.
+                adv_estimator = str(self.cfg.trainer.algorithm.advantage_estimator).lower()
+                if adv_estimator != "grpo":
+                    raise ValueError(
+                        "stepwise_credit_assignment=discounted_return_to_go currently supports only "
+                        "trainer.algorithm.advantage_estimator='grpo' (got "
+                        f"{self.cfg.trainer.algorithm.advantage_estimator!r})."
+                    )
+                # NOTE: This path is only valid for step-wise trajectories, where each batch element is one env step.
+                # We compute a scalar reward per step (sum of token-level rewards for that step sample), then compute
+                # discounted return-to-go within each trajectory, identified by `is_last_step` boundaries.
+                is_last_step_full = data["is_last_step"].bool()
+                response_mask_full = data["response_mask"]
+                # GRPO does not use a critic baseline.
+                values_full = None
+
+                pad_size = int(data.metadata.get("pad_size", 0) or 0)
+                num_samples = len(token_level_rewards)
+                valid_n = max(0, int(num_samples) - pad_size)
+
+                # Default outputs are zeros; padding samples remain zeroed.
+                advantages = torch.zeros_like(token_level_rewards)
+                returns = torch.zeros_like(token_level_rewards)
+                if valid_n == 0:
+                    data["returns"] = returns
+                    data["advantages"] = advantages
+                    return data
+
+                # Compute per-step scalar reward for valid samples.
+                step_rewards = token_level_rewards[:valid_n].sum(dim=-1)  # [valid_n]
+                is_last_step = is_last_step_full[:valid_n]
+
+                # Build a trajectory id per step sample from is_last_step boundaries.
+                # traj_ids[i] == trajectory index (0..num_traj-1) for step sample i.
+                traj_ids = (
+                    torch.cat(
+                        [torch.tensor([False], device=is_last_step.device, dtype=is_last_step.dtype), is_last_step[:-1]]
+                    )
+                    .int()
+                    .cumsum(dim=0)
+                )
+                num_traj = int(traj_ids[-1].item()) + 1
+
+                # Discount factor (gamma) for per-step return-to-go.
+                if not hasattr(self.cfg.trainer.algorithm, "stepwise_discount_gamma"):
+                    raise ValueError(
+                        "Missing required config: trainer.algorithm.stepwise_discount_gamma. "
+                        "This must be explicitly set when stepwise_credit_assignment=discounted_return_to_go."
+                    )
+                if self.cfg.trainer.algorithm.stepwise_discount_gamma is None:
+                    raise ValueError(
+                        "trainer.algorithm.stepwise_discount_gamma is None. "
+                        "This must be explicitly set when stepwise_credit_assignment=discounted_return_to_go."
+                    )
+                gamma = float(self.cfg.trainer.algorithm.stepwise_discount_gamma)
+                if not (0.0 <= gamma <= 1.0):
+                    raise ValueError(f"stepwise_discount_gamma must be in [0, 1], got {gamma}")
+
+                # Compute discounted return-to-go per step within each trajectory.
+                # We iterate trajectories and do a backward pass over their steps.
+                step_returns = torch.zeros_like(step_rewards)  # [valid_n]
+                for tid in range(num_traj):
+                    idxs = (traj_ids == tid).nonzero(as_tuple=True)[0]
+                    if idxs.numel() == 0:
+                        continue
+                    running = torch.zeros((), device=step_rewards.device, dtype=step_rewards.dtype)
+                    for i in reversed(idxs.tolist()):
+                        running = step_rewards[i] + gamma * running
+                        step_returns[i] = running
+
+                # Step index within the trajectory: 0..T-1 for each step sample.
+                step_idx = torch.zeros(valid_n, device=step_returns.device, dtype=torch.long)
+                for tid in range(num_traj):
+                    idxs = (traj_ids == tid).nonzero(as_tuple=True)[0]
+                    if idxs.numel() == 0:
+                        continue
+                    step_idx[idxs] = torch.arange(idxs.numel(), device=step_returns.device, dtype=torch.long)
+
+                # GRPO baseline/normalization: for each prompt uid and step index, normalize the discounted
+                # return-to-go across rollouts (repetitions).
+                # This gives step-wise credit assignment while remaining "GRPO" (group-relative).
+                uids = data.metadata["uids"][:valid_n]
+                grpo_norm_by_std = bool(getattr(self.cfg.trainer.algorithm, "grpo_norm_by_std", True))
+                epsilon = 1e-6
+                step_adv = torch.zeros_like(step_returns)  # [valid_n]
+
+                # Group indices by (uid, step_idx). (This is the smallest clean implementation; batch sizes are modest.)
+                from collections import defaultdict
+
+                groups: dict[tuple[str, int], list[int]] = defaultdict(list)
+                for i in range(valid_n):
+                    groups[(str(uids[i]), int(step_idx[i].item()))].append(i)
+
+                for _, idxs in groups.items():
+                    if len(idxs) <= 1:
+                        # If there's only one rollout at this step index, we cannot estimate a group baseline.
+                        # Match SkyRL's GRPO behavior for singleton groups: baseline=0 (and std=1 if normalizing),
+                        # so the advantage is just the raw score/return-to-go.
+                        for i in idxs:
+                            step_adv[i] = step_returns[i]
+                        continue
+                    vals = step_returns[idxs]
+                    mean = vals.mean()
+                    if grpo_norm_by_std:
+                        std = vals.std(unbiased=False)
+                        normed = (vals - mean) / (std + epsilon)
+                    else:
+                        normed = vals - mean
+                    step_adv[idxs] = normed
+
+                # Token-level tensors (GRPO uses the same tensor for advantages and returns).
+                adv_token = step_adv.unsqueeze(-1) * response_mask_full[:valid_n]
+                advantages[:valid_n] = adv_token
+                returns[:valid_n] = adv_token
+            elif stepwise_mode != "broadcast_last_step":
+                raise ValueError(
+                    f"Unknown stepwise_credit_assignment={stepwise_mode!r}. "
+                    "Expected 'broadcast_last_step' or 'discounted_return_to_go'."
+                )
+            else:
+                is_last_step = data["is_last_step"].bool()
+                response_mask = data["response_mask"]
+                index = np.array(data.metadata["uids"])
+                adv_estimator = self.cfg.trainer.algorithm.advantage_estimator
+                config = self.cfg.trainer.algorithm
+                values = data["values"]
+                gamma = self.cfg.trainer.algorithm.gamma
+                lambd = self.cfg.trainer.algorithm.lambd
+                grpo_norm_by_std = self.cfg.trainer.algorithm.grpo_norm_by_std
+                last_step_rewards = token_level_rewards[is_last_step]
+                # compatible with any advantage estimator
+                last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
+                    token_level_rewards=last_step_rewards,
+                    response_mask=response_mask[is_last_step],
+                    index=index[is_last_step.cpu().numpy()],
+                    adv_estimator=adv_estimator,
+                    values=values[is_last_step] if values is not None else None,
+                    config=config,
+                    gamma=gamma,
+                    lambd=lambd,
+                    grpo_norm_by_std=grpo_norm_by_std,
+                )
+                traj_ids = (
+                    torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]])
+                    .int()
+                    .cumsum(dim=0)
+                )
+                num_groups = traj_ids[-1].item() + 1
+                assert num_groups == len(
+                    last_step_advantages
+                ), f"number of groups {num_groups} doesn't match the number of trajectories as given by `is_last_step` {len(last_step_advantages)}. The `is_last_step` tensor is likely malformed"
+                advantages = last_step_advantages[traj_ids]
+                returns = last_step_returns[traj_ids]
         else:
             advantages, returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards,
