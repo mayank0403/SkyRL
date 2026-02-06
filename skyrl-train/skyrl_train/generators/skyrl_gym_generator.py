@@ -462,6 +462,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             output = engine_output["responses"][0]
             output_ids = engine_output["response_ids"][0]
             stop_reason = engine_output["stop_reasons"][0]
+            generation_ms = None
+            if engine_output.get("generation_ms") is not None:
+                generation_ms = engine_output["generation_ms"][0]
             response_logprobs = engine_output.get("response_logprobs", None)
             if response_logprobs is not None:
                 response_logprobs = response_logprobs[0]
@@ -485,7 +488,8 @@ class SkyRLGymGenerator(GeneratorInterface):
                     added_eos = True
 
             # 2. Environment step
-            env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
+            action_payload = {"text": output, "generation_ms": generation_ms}
+            env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, action_payload)
             new_obs = env_step_output["observations"]
             step_reward: float = env_step_output["reward"]
             agent_loop_state.done = env_step_output["done"]
@@ -786,6 +790,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         outputs = engine_output["responses"]
         responses = engine_output["response_ids"]
         stop_reasons = engine_output["stop_reasons"]
+        generation_ms = engine_output.get("generation_ms") or [None for _ in outputs]
         logprobs = engine_output.get("response_logprobs", None)
 
         truncated_responses = []
@@ -796,7 +801,8 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
             # step on environment and compute reward
-            env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
+            action_payload = {"text": output, "generation_ms": generation_ms[i]}
+            env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, action_payload)
             reward = env_step_output["reward"]
             rewards.append(reward)
 

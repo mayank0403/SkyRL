@@ -29,6 +29,7 @@ class InferenceEngineOutput(TypedDict):
     response_ids: List[List[int]]
     stop_reasons: List[str]
     response_logprobs: Optional[List[List[float]]]
+    generation_ms: Optional[List[float]]
 
 
 class InferenceEngineInterface(ABC):

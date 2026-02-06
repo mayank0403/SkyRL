@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import random
 import threading
 from dataclasses import dataclass, field
@@ -135,7 +136,7 @@ class InferenceEngineClient(InferenceEngineInterface):
                 prompt_token_ids=cur_prompt_token_ids,
                 sampling_params=sampling_params,
             )
-            tasks.append(asyncio.create_task(self.engines[engine_idx].generate(engine_input)))
+            tasks.append(asyncio.create_task(self._timed_generate(self.engines[engine_idx], engine_input)))
             indices_list.append(prompt_ids)
 
         results = await asyncio.gather(*tasks)
@@ -146,14 +147,16 @@ class InferenceEngineClient(InferenceEngineInterface):
         stop_reasons: list[str] = [""] * n
         response_logprobs: List[Optional[List[float]]] = [None for _ in range(n)]
         response_ids: List[List[int]] = [[] for _ in range(n)]
+        generation_ms: List[Optional[float]] = [None for _ in range(n)]
         # a bit hacky for now
         add_resp_logprobs = False
 
-        for indices, result in zip(indices_list, results):
+        for indices, (result, elapsed_ms) in zip(indices_list, results):
             for local_idx, original_idx in enumerate(indices):
                 responses[original_idx] = result["responses"][local_idx]
                 stop_reasons[original_idx] = result["stop_reasons"][local_idx]
                 response_ids[original_idx] = result["response_ids"][local_idx]
+                generation_ms[original_idx] = float(elapsed_ms)
                 if result.get("response_logprobs", None):
                     add_resp_logprobs = True
                     response_logprobs[original_idx] = result["response_logprobs"][local_idx]
@@ -163,7 +166,16 @@ class InferenceEngineClient(InferenceEngineInterface):
             stop_reasons=stop_reasons,
             response_ids=response_ids,
             response_logprobs=response_logprobs if add_resp_logprobs else None,
+            generation_ms=[float(x) if x is not None else 0.0 for x in generation_ms],
         )
+
+    async def _timed_generate(
+        self, engine: InferenceEngineInterface, engine_input: InferenceEngineInput
+    ) -> tuple[InferenceEngineOutput, float]:
+        start = time.perf_counter()
+        result = await engine.generate(engine_input)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return result, elapsed_ms
 
     def _select_engine_idx(self, session_id: Optional[Union[str, int]] = None) -> int:
         """Select an engine index for routing a request.
@@ -265,6 +277,7 @@ class InferenceEngineClient(InferenceEngineInterface):
         num_turns = 0
 
         # 3. Loop until geneartion is completed.
+        start_ts = time.perf_counter()
         while stop_reason == "abort":
             await self._wait_for_generation_to_resume()
 
@@ -309,11 +322,13 @@ class InferenceEngineClient(InferenceEngineInterface):
             final_text_response = text_response
         else:
             final_text_response = self.tokenizer.decode(accum_response_ids, skip_special_tokens=True)
+        elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
         return InferenceEngineOutput(
             responses=[final_text_response],
             stop_reasons=[stop_reason],
             response_ids=[accum_response_ids],
             response_logprobs=[accum_response_logprobs] if len(accum_response_logprobs) > 0 else None,
+            generation_ms=[float(elapsed_ms)],
         )
 
     async def _chat_completion_with_retry(
